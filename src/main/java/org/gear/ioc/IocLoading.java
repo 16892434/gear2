@@ -112,11 +112,10 @@ public class IocLoading {
 			Object[] array = (Object[])obj;
 			IocValue[] ivs = new IocValue[array.length];
 			for(int i = 0; i < ivs.length; i++) {
-				ivs[i] = object2value(ivs[i]);
+				ivs[i] = object2value(array[i]);
 			}
 			iv.setType(IocValue.TYPE_NORMAL);
 			iv.setValue(ivs);
-			// TODO nutz bug ?
 			return iv;
 		}
 		// collection
