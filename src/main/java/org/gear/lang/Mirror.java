@@ -1,6 +1,7 @@
 package org.gear.lang;
 
 import java.lang.annotation.Annotation;
+import java.lang.reflect.Array;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -8,16 +9,30 @@ import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
+import org.gear.castor.FailToCastObjectException;
+import org.gear.lang.born.BornContext;
+import org.gear.lang.born.Borning;
+import org.gear.lang.born.BorningException;
+import org.gear.lang.born.Borns;
+import org.gear.lang.eject.EjectByField;
+import org.gear.lang.eject.EjectByGetter;
+import org.gear.lang.eject.Ejecting;
+import org.gear.lang.inject.InjectByField;
+import org.gear.lang.inject.InjectBySetter;
+import org.gear.lang.inject.Injecting;
 import org.gear.util.Callback;
 import org.gear.util.Callback3;
 import org.gear.util.Strings;
-import org.nutz.lang.FailToSetValueException;
 
 public class Mirror<T> {
 
@@ -117,6 +132,13 @@ public class Mirror<T> {
 	
 	public Class<T> getType() {
 		return klass;
+	}
+	
+	/**
+	 * @return 对象提炼类型数组。从对象自身的类型到 Object，中间的继承关系中最有特点的几个类型
+	 */
+	public Class<?>[] extractTypes() {
+		return typeExtractor.extract(this);
 	}
 	
 	/**
@@ -641,7 +663,8 @@ public class Mirror<T> {
 		// 非null值，进行转换
 		if(null != value) {
 			try {
-				value = Castors.me().castTo(value, field.getType());
+				// TODO waiting for implement Castors.me().castTo()(value, field.getType())
+				// value = Castors.me().castTo(value, field.getType());
 			}catch(FailToCastObjectException e) {
 				throw makeSetValueException(obj.getClass(), field.getName(), value, e);
 			}
@@ -667,7 +690,85 @@ public class Mirror<T> {
 		}
 	}
 	
-	// TODO waiting to add
+	/**
+	 * 为对象的一个字段设值。优先调用 setter 方法。
+	 * 
+	 * @param obj
+	 *            对象
+	 * @param fieldName
+	 *            字段名
+	 * @param value
+	 *            值
+	 * @throws FailToSetValueException
+	 */
+	public void setValue(Object obj, String fieldName, Object value) throws FailToSetValueException {
+		if(null == value) {
+			try {
+				setValue(obj, this.getField(fieldName), value);
+			}catch(Exception e) {
+				throw makeSetValueException(obj.getClass(), fieldName, value, e);
+			}
+		} else {
+			try {
+				this.getSetter(fieldName, value.getClass()).invoke(obj, value);
+			}catch(Exception e) {
+				try {
+					setValue(obj, this.getField(fieldName), value);
+				}catch(Exception ex) {
+					throw makeSetValueException(obj.getClass(), fieldName, value, ex);
+				}
+			}
+		}
+	}
+	
+	private static RuntimeException makeGetValueException(Class<?> type, String name, Throwable e) {
+		return new FailToGetValueException(String.format("Fail to get value for [%s]->[%s]",
+														type.getName(),
+														name), e);
+	}
+	
+	/**
+	 * 不调用 getter，直接获得字段的值
+	 * 
+	 * @param obj
+	 *            对象
+	 * @param f
+	 *            字段
+	 * @return 字段的值。
+	 * @throws FailToGetValueException
+	 */
+	public Object getValue(Object obj, Field field) throws FailToGetValueException {
+		if(!field.isAccessible())
+			field.setAccessible(true);
+		try {
+			return field.get(obj);
+		}catch(Exception e) {
+			throw makeGetValueException(obj.getClass(), field.getName(), e);
+		}
+	}
+	
+	/**
+	 * 优先通过 getter 获取字段值，如果没有，则直接获取字段值
+	 * 
+	 * @param obj
+	 *            对象
+	 * @param name
+	 *            字段名
+	 * @return 字段值
+	 * @throws FailToGetValueException
+	 *             既没发现 getter，又没有字段
+	 */
+	public Object getValue(Object obj, String name) throws FailToGetValueException {
+		try {
+			return this.getGetter(name).invoke(obj);
+		}catch(Exception e) {
+			try {
+				return getValue(obj, this.getField(name));
+			}catch(Exception ex) {
+				throw makeGetValueException(obj.getClass(), name, ex);
+			}
+		}
+	}
 	
 	/**
 	 * @return 获得外覆类
@@ -702,6 +803,326 @@ public class Mirror<T> {
 	}
 	
 	/**
+	 * @return 获得外覆类，如果没有外覆类，则返回自身的类型
+	 */
+	public Class<?> getWrapper() {
+		if(klass.isPrimitive())
+			return getWrapperClass();
+		return klass;
+	}
+	
+	/**
+	 * @return 如果当前类为内部类，则返回其外部类。否则返回 null
+	 */
+	public Class<?> getOuterClass() {
+		if(Modifier.isStatic(klass.getModifiers()))
+			return null;
+		String name = klass.getName();
+		int pos = name.indexOf("$");
+		if(pos == -1)
+			return null;
+		name = name.substring(0, pos);
+		try {
+			return Lang.loadClass(name);
+		}catch(ClassNotFoundException e) {
+			return null;
+		}
+	}
+	
+	/**
+	 * 获取对象构建器
+	 * 
+	 * @param args
+	 *            构造函数参数
+	 * @return 当前对象的构建方式。
+	 * 
+	 * @throws BorningException
+	 *             当没有发现合适的 Borning 时抛出
+	 * 
+	 * @see org.gear.lang.born.Borning
+	 */
+	public Borning<T> getBorning(Object... args) throws BorningException {
+		BornContext<T> bc = Borns.eval(klass, args);
+		if(null == bc)
+			throw new BorningException(klass, args);
+		
+		return bc.getBorning();
+	}
+	
+	/**
+	 * 获取对象构建器
+	 * 
+	 * @param argTypes
+	 *            构造函数参数类型数组
+	 * @return 当前对象构建方式
+	 * 
+	 * @throws BorningException
+	 *             当没有发现合适的 Borning 时抛出
+	 */
+	public Borning<T> getBorningByArgTypes(Class<?>... argTypes) throws BorningException {
+		BornContext<T> bc = Borns.evalByArgTypes(klass, argTypes);
+		if(null == bc)
+			throw new BorningException(klass, argTypes);
+		return bc.getBorning();
+	}
+	
+	/**
+	 * 根据构造函数参数，创建一个对象。
+	 * 
+	 * @param args
+	 *            构造函数参数
+	 * @return 新对象
+	 */
+	public T born(Object... args) {
+		return Borns.eval(klass, args).doBorn();
+	}
+	
+	private static boolean doMatchMethodParamsType(Class<?>[] paramTypes, Class<?>[] methodArgTypes) {
+		if(paramTypes.length == 0 && methodArgTypes.length == 0)
+			return true;
+		if(paramTypes.length == methodArgTypes.length) {
+			for(int i = 0; i < paramTypes.length; i++)
+				if(!Mirror.me(paramTypes[i]).canCastToDirectly(methodArgTypes[i]))
+					return false;
+			return true;
+		} 
+		// 可变参数
+		else if(paramTypes.length + 1 == methodArgTypes.length) {
+			if(!methodArgTypes[paramTypes.length].isArray())
+				return false;
+			for(int i = 0; i < paramTypes.length; i++)
+				if(!Mirror.me(paramTypes[i]).canCastToDirectly(methodArgTypes[i]))
+					return false;
+			return true;
+		}
+		return false;
+	}
+	
+	/**
+	 * 根据函数名称和参数，返回一个函数调用方式
+	 * 
+	 * @param methodName
+	 *            函数名
+	 * @param args
+	 *            参数
+	 * @return 函数调用方式
+	 */
+	public Invoking getInvoking(String methodName, Object... args) {
+		return new Invoking(klass, methodName, args);
+	}
+	
+	/**
+	 * 根据字段名，得出一个字段注入方式。优先用 Setter
+	 * 
+	 * @param fieldName
+	 *            字段名
+	 * @return 注入方式。
+	 */
+	public Injecting getInjecting(String fieldName) {
+		Method[] sss = this.findSetters(fieldName);
+		if(sss.length == 1)
+			return new InjectBySetter(sss[0]);
+		else
+			try {
+				Field field = this.getField(fieldName);
+				try {
+					return new InjectBySetter(this.getSetter(field));
+				}catch(NoSuchMethodException e) {
+					return new InjectByField(field);
+				}
+			}catch(NoSuchFieldException ex) {
+				throw Lang.wrapThrow(ex);
+			}
+	}
+	
+	/**
+	 * 根据字段名获得一个字段输入方式。优先用 Getter
+	 * 
+	 * @param fieldName
+	 *            字段名
+	 * @return 输出方式
+	 */
+	public Ejecting getEjecting(String fieldName) {
+		try {
+			return new EjectByGetter(getGetter(fieldName));
+		}catch(NoSuchMethodException e) {
+			try {
+				Field field = this.getField(fieldName);
+				try {
+					return new EjectByGetter(getGetter(field));
+				}catch(NoSuchMethodException e1) {
+					return new EjectByField(field);
+				}
+			}catch(NoSuchFieldException ex) {
+				throw Lang.wrapThrow(ex);
+			}
+		}
+	}
+	
+	/**
+	 * 调用对象的一个方法
+	 * 
+	 * @param obj
+	 *            对象
+	 * @param methodName
+	 *            方法名
+	 * @param args
+	 *            参数
+	 * @return 调用结果
+	 */
+	public Object invoke(Object obj, String methodName, Object...args) {
+		return getInvoking(methodName, args).invoke(obj);
+	}
+	
+	/**
+	 * 查找一个方法。匹配的很宽泛
+	 * 
+	 * @param name
+	 *            方法名
+	 * @param paramTypes
+	 *            参数类型列表
+	 * @return 方法
+	 * @throws NoSuchMethodException
+	 */
+	public Method findMethod(String name, Class<?>...paramTypes) throws NoSuchMethodException {
+		try {
+			return klass.getMethod(name, paramTypes);
+		}catch(NoSuchMethodException e) {
+			for(Method m : klass.getMethods()) {
+				if(m.getName().equals(name)) {
+					if(doMatchMethodParamsType(paramTypes, m.getParameterTypes()))
+						return m;
+				}
+			}
+		}
+		throw new NoSuchMethodException(String.format("Fail to find Method %s->%s with params: \n%s",
+													klass.getName(),
+													name,
+													// TODO waiting for implement Castors.me().castToString(paramTypes)
+													// Castors.me().castToString(paramTypes)));
+													null));
+	}
+	
+	/**
+	 * 根据名称和参数个数，查找一组方法
+	 * 
+	 * @param name
+	 *            方法名
+	 * @param argNumber
+	 *            参数个数
+	 * @return 方法数组
+	 */
+	public Method[] findMethods(String name, int argNumber) {
+		List<Method> methods = new LinkedList<Method>();
+		for(Method m : klass.getMethods()) {
+			if(m.getName().equals(name))
+				if(argNumber < 0)
+					methods.add(m);
+				else if(m.getParameterTypes().length == argNumber)
+					methods.add(m);
+		}
+		return methods.toArray(new Method[methods.size()]);
+	}
+	
+	/**
+	 * 根据返回值类型，以及参数类型，查找第一个匹配的方法
+	 * 
+	 * @param returnType
+	 *            返回值类型
+	 * @param paramTypes
+	 *            参数个数
+	 * @return 方法
+	 * @throws NoSuchMethodException
+	 */
+	public Method findMethod(Class<?> returnType, Class<?>...paramTypes) throws NoSuchMethodException {
+		for(Method m : klass.getMethods()) {
+			if(returnType == m.getReturnType())
+				if(paramTypes.length == m.getParameterTypes().length) {
+					boolean noThisOne = false;
+					for(int i = 0; i < paramTypes.length; i++) {
+						if(paramTypes[i] != m.getParameterTypes()[i]) {
+							noThisOne = true;
+							break;
+						}
+					}
+					if(!noThisOne)
+						return m;
+				}
+		}
+		throw new NoSuchMethodException(String.format("Can not find method in [%s] with return type '%s' and arguments \n'%s'!",
+													klass.getName(),
+													returnType.getName(),
+													// TODO waiting for implement Castors.me().castToString(paramTypes)
+													// Castors.me().castToString(paramTypes)));
+													null));
+	}
+	
+	/**
+	 * 一个方法的参数类型同一个给定的参数数组是否可以匹配
+	 * 
+	 * @param methodParamTypes
+	 *            参数类型列表
+	 * @param args
+	 *            参数
+	 * @return 匹配类型
+	 * 
+	 * @see org.gear.lang.MatchType
+	 */
+	public static MatchType matchParamTypes(Class<?>[] methodParamTypes, Object...args) {
+		return matchParamTypes(methodParamTypes, evalToTypes(args));
+	}
+	
+	/**
+	 * 将一组对象，变成一组类型
+	 * 
+	 * @param args
+	 *            对象数组
+	 * @return 类型数组
+	 */
+	public static Class<?>[] evalToTypes(Object...args) {
+		Class<?>[] types = new Class[args.length];
+		int i = 0;
+		for(Object obj : args) {
+			types[i++] = null == obj ? Object.class : obj.getClass();
+		}
+		return types;
+	}
+	
+	/**
+	 * 匹配一个函数声明的参数类型数组和一个调用参数数组
+	 * 
+	 * @param paramTypes
+	 *            函数声明参数数组
+	 * @param argTypes
+	 *            调用参数数组
+	 * @return 匹配类型
+	 * 
+	 * @see org.gear.lang.MatchType
+	 */
+	public static MatchType matchParamTypes(Class<?>[] paramTypes, Class<?>[] argTypes) {
+		int len = null == argTypes ? 0 : argTypes.length;
+		if(len == 0 && paramTypes.length == 0) {
+			return MatchType.YES;
+		}
+		if(paramTypes.length == len) {
+			for(int i = 0; i < paramTypes.length; i++) {
+				if(!Mirror.me(argTypes[i]).canCastToDirectly(paramTypes[i]))
+					return MatchType.NO;
+			}
+			return MatchType.YES;
+		} else if( len + 1 == paramTypes.length) {
+			if(!paramTypes[len].isArray())
+				return MatchType.NO;
+			for(int i = 0; i < len; i++) {
+				if(!Mirror.me(argTypes[i]).canCastToDirectly(paramTypes[i]))
+					return MatchType.NO;
+			}
+			return MatchType.LACK;
+		}
+		return MatchType.NO;
+	}
+	
+	/**
 	 * @param type
 	 *            目标类型
 	 * @return 判断当前对象是否能直接转换到目标类型，而不产生异常
@@ -728,6 +1149,17 @@ public class Mirror<T> {
 	 */
 	public boolean is(Class<?> type) {
 		return null != type && klass == type;
+	}
+	
+	/**
+	 * 判断当前对象是否为一个类型。精确匹配，即使是父类和接口，也不相等
+	 * 
+	 * @param className
+	 *            类型名称
+	 * @return 是否相等
+	 */
+	public boolean is(String className) {
+		return klass.getName().equals(className);
 	}
 	
 	/**
@@ -857,15 +1289,174 @@ public class Mirror<T> {
 	}
 	
 	/**
-	 * 判断当前对象是否为一个类型。精确匹配，即使是父类和接口，也不相等
+	 * 如果不是容器，也不是 POJO，那么它必然是个 Obj
 	 * 
-	 * @param className
-	 *            类型名称
-	 * @return 是否相等
+	 * @return true or false
 	 */
-	public boolean is(String typeName) {
-		return klass.getName().equals(typeName);
+	public boolean isObj() {
+		return isContainer() || isPojo();
 	}
+	
+	/**
+	 * 判断当前类型是否为POJO。 除了下面的类型，其他均为 POJO
+	 * <ul>
+	 * <li>原生以及所有包裹类
+	 * <li>类字符串
+	 * <li>类日期
+	 * <li>非容器
+	 * </ul>
+	 * 
+	 * @return true or false
+	 */
+	public boolean isPojo() {
+		if(klass.isPrimitive())
+			return false;
+		if(this.isStringLike() || this.isDateTimeLike())
+			return false;
+		if(this.isPrimitiveNumber() || this.isBoolean() || this.isChar())
+			return false;
+		return !isContainer();
+	}
+	
+	/**
+	 * 判断当前类型是否为容器，包括 Map，Collection, 以及数组
+	 * 
+	 * @return true of false
+	 */
+	public boolean isContainer() {
+		return isColl() || isMap();
+	}
+	
+	/**
+	 * 判断当前类型是否为数组
+	 * 
+	 * @return true of false
+	 */
+	public boolean isArray() {
+		return klass.isArray();
+	}
+	
+	/**
+	 * 判断当前类型是否为 Collection
+	 * 
+	 * @return true of false
+	 */
+	public boolean isCollection() {
+		return isOf(Collection.class);
+	}
+	
+	/**
+	 * @return 当前类型是否是数组或者集合
+	 */
+	public boolean isColl() {
+		return isArray() || isCollection();
+	}
+	
+	/**
+	 * 判断当前类型是否为 Map
+	 * 
+	 * @return true of false
+	 */
+	public boolean isMap() {
+		return isOf(Map.class);
+	}
+	
+	/**
+	 * @return 当前对象是否为数字
+	 */
+	public boolean isNumber() {
+		return Number.class.isAssignableFrom(klass)
+				|| klass.isPrimitive()
+				&& !is(boolean.class)
+				&& !is(char.class);
+	}
+	
+	/**
+	 * @return 当前对象是否在表示日期或时间
+	 */
+	public boolean isDateTimeLike() {
+		return Calendar.class.isAssignableFrom(klass)
+				|| java.util.Date.class.isAssignableFrom(klass)
+				|| java.sql.Date.class.isAssignableFrom(klass)
+				|| java.sql.Time.class.isAssignableFrom(klass);
+	}
+	
+	public String toString() {
+		return klass.getName();
+	}
+	
+	/**
+	 * 根据函数参数类型数组的最后一个类型（一定是数组，表示变参），为最后一个变参生成一个空数组
+	 * 
+	 * @param pts
+	 *            函数参数类型列表
+	 * @return 变参空数组
+	 */
+	public static Object[] blankArrayArg(Class<?>[] pts) {
+		return (Object[]) Array.newInstance(pts[pts.length - 1].getComponentType(), 0);
+	}
+	
+	/**
+	 * 获取一个类的泛型参数数组，如果这个类没有泛型参数，返回 null
+	 */
+	public static Type[] getTypeParams(Class<?> klass) {
+		// TODO 这个实现会导致泛形丢失，只能取得申明类型
+		if(klass == null || "java.lang.Object".equals(klass.getName()))
+			return null;
+		// 父类
+		Type superclass = klass.getGenericSuperclass();
+		if(null != superclass && superclass instanceof ParameterizedType)
+			return ((ParameterizedType)superclass).getActualTypeArguments();
+		// 接口
+		Type[] interfaces = klass.getGenericInterfaces();
+		for(Type inf : interfaces) {
+			if(inf instanceof ParameterizedType) {
+				return ((ParameterizedType)inf).getActualTypeArguments();
+			}
+		}
+		return getTypeParams(klass.getSuperclass());
+	}
+	
+	private static final Pattern PTN = Pattern.compile("(<)(.+)(>)");
+	
+	/**
+	 * 获取一个字段的泛型参数数组，如果这个字段没有泛型，返回空数组
+	 * 
+	 * @param f
+	 *            字段
+	 * @return 泛型参数数组
+	 */
+	public static Class<?>[] getGenericsTypes(Field f) {
+		String gts = f.toGenericString();
+		Matcher m = PTN.matcher(gts);
+		if(m.find()) {
+			String s = m.group(2);
+			String[] ss = Strings.splitIgnoreBlank(s);
+			if(ss.length > 0) {
+				Class<?>[] re = new Class<?>[ss.length];
+				try {
+					for(int i = 0; i < ss.length; i++) {
+						String className = ss[i];
+						if(className.length() > 0 && className.charAt(0) == '?') {
+							re[i] = Object.class;
+						} else {
+							int pos = className.indexOf('<');
+							if(pos < 0)
+								re[i] = Lang.loadClass(className);
+							else 
+								re[i] = Lang.loadClass(className.substring(0, pos));
+						}
+					}
+					return re;
+				}catch(ClassNotFoundException e) {
+					throw Lang.wrapThrow(e);
+				}
+			}
+		}
+		return new Class<?>[0];
+	}
+	
+	// TODO waiting for implement ...
 	
 	public Class<?> unWrapper() {
 		return TypeMapping2.get(klass);
